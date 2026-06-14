@@ -6,11 +6,6 @@ from typing import TypedDict, Optional
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from langgraph.graph import StateGraph
-try:
-    from IPython.display import Image, display
-    _IPYTHON = True
-except ImportError:
-    _IPYTHON = False
 
 load_dotenv()
 
@@ -46,7 +41,7 @@ class AgentState(TypedDict):
     products:      list          # rows from CSV as dicts
     access_token:  Optional[str]
     auth_error:    Optional[str]
-    raw_prices:    dict          # sku_id → kroger price (float | None)
+    raw_prices:    dict          # sku_id → {"price": float|None, "error": str|None}
 
     # Outputs
     results:       list          # final list of report dicts
@@ -116,7 +111,7 @@ def auth_kroger(state: AgentState) -> AgentState:
 #  NODE 3 — FETCH COMPETITOR PRICES
 # ─────────────────────────────────────────────
 
-def _fetch_kroger_price(product: dict, token: str, location_id: str) -> Optional[float]:
+def _fetch_kroger_price(product: dict, token: str, location_id: str) -> tuple[Optional[float], Optional[str]]:
     """Search Kroger's catalogue by product name and return the first shelf price."""
     headers = {"Authorization": f"Bearer {token}"}
     search_term = f"{product['product_name']} {product['unit']}"
@@ -131,7 +126,6 @@ def _fetch_kroger_price(product: dict, token: str, location_id: str) -> Optional
                             params=params, timeout=10, verify=False)
         resp.raise_for_status()
         items = resp.json().get("data", [])
-        items = resp.json().get("data", [])
 
         logger.info(f"Search Term: {search_term}")
 
@@ -141,12 +135,22 @@ def _fetch_kroger_price(product: dict, token: str, location_id: str) -> Optional
             )
 
         if not items:
-            return None
-        prices = items[0].get("items", [{}])[0].get("price", {})
-        # prefer "promo" price if available, otherwise "regular"
-        return float(prices.get("promo") or prices.get("regular") or 0) or None
-    except Exception:
-        return None
+            return None, "FETCH_ERROR: No Kroger items found"
+
+        item = items[0]
+        prices = item.get("items", [{}])[0].get("price", {})
+        price = float(prices.get("promo") or prices.get("regular") or 0) or None
+        if price is None:
+            return None, "FETCH_ERROR: No price found in Kroger response"
+
+        return price, None
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        return None, f"FETCH_ERROR: HTTP {status} from Kroger API"
+    except requests.Timeout:
+        return None, "FETCH_ERROR: Request timed out"
+    except Exception as exc:
+        return None, f"FETCH_ERROR: {exc}"
 
 
 def fetch_prices(state: AgentState) -> AgentState:
@@ -154,6 +158,7 @@ def fetch_prices(state: AgentState) -> AgentState:
     logger.info("[NODE 3/5]   Fetching Kroger competitor prices …")
 
     token      = state.get("access_token")
+    auth_error = state.get("auth_error")
     raw_prices = {}
     errors     = list(state.get("errors", []))
 
@@ -161,24 +166,22 @@ def fetch_prices(state: AgentState) -> AgentState:
         sku  = product["sku_id"]
         
         if not token:
-            price = None
-            tag = "NO-TOKEN"
+            raw_prices[sku] = {"price": None, "error": auth_error or "AUTH_ERROR: No access token"}
+            errors.append(f"{sku}: {auth_error}")
+            continue
         else:
-            price = _fetch_kroger_price(
+            price, error = _fetch_kroger_price(
                 product,
                 token,
                 state["location_id"]
             )
-            tag = "LIVE"
+            raw_prices[sku] = {"price": price, "error": error}
 
-        raw_prices[sku] = price
-        status = f"${price:.2f}" if price else "N/A"
-        logger.info(
-            f"{sku} -> Kroger Price: {status} [{tag}]"
-        )
-
-        if price is None:
-            errors.append(f"{sku}: Could not retrieve Kroger price.")
+        if price is not None:
+            logger.info(f"{sku} -> Kroger Price: ${price:.2f} [LIVE]")
+        else:
+            logger.warning(f"{sku} -> N/A [{error}]")
+            errors.append(f"{sku}: {error}")
 
     return {**state, "raw_prices": raw_prices, "errors": errors}
 
@@ -231,6 +234,23 @@ HEADLINE_MAP = {
     "SURCHARGE": "Margin Expansion Opportunity",
 }
 
+def _failed_entry(sku: str, our_price: float, headline: str, reasoning: str) -> dict:
+    return {
+        "agent_id":          "competitor_pricing",
+        "status":            "ERROR",
+        "timestamp":         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "metrics_evaluated": {
+            "sku":               sku,
+            "our_current_price": round(our_price, 2),
+            "competitor_price":  None,
+        },
+        "proposal":    None,
+        "justification": {
+            "headline":           headline,
+            "detailed_reasoning": reasoning,
+        },
+    }
+
 def analyze(state: AgentState) -> AgentState:
     """Compare our prices vs Kroger and generate proposals for each SKU."""
     logger.info("[NODE 4/5]   Analysing prices and generating proposals …")
@@ -242,25 +262,17 @@ def analyze(state: AgentState) -> AgentState:
     for product in state["products"]:
         sku       = product["sku_id"]
         our_price = float(product["our_price"])
-        comp_price = state["raw_prices"].get(sku)
+        price_rec   = state["raw_prices"].get(sku, {"price": None, "error": "No price record found"})
+        comp_price  = price_rec["price"]
+        fetch_error = price_rec["error"]
 
         if comp_price is None:
-            status = "FAILED"
-            entry  = {
-                "agent_id":         "competitor_pricing",
-                "status":           status,
-                "timestamp":        timestamp,
-                "metrics_evaluated": {
-                    "sku":               sku,
-                    "our_current_price": our_price,
-                    "competitor_price":  None,
-                },
-                "proposal": None,
-                "justification": {
-                    "headline":          "Data Unavailable",
-                    "detailed_reasoning": f"Could not retrieve Kroger price for SKU {sku}.",
-                },
-            }
+            entry = _failed_entry(
+                sku       = sku,
+                our_price = our_price,
+                headline  = "Competitor Price Unavailable",
+                reasoning = fetch_error or f"Could not retrieve Kroger price for SKU {sku}.",
+            )
         else:
             action, modifier, confidence, reasoning = _build_proposal(our_price, comp_price)
             entry = {
@@ -357,16 +369,6 @@ app = graph.compile()
 #  ENTRY POINT
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-
-    # ── Visualise the graph (works in Jupyter; prints ASCII fallback in CLI) ─
-    try:
-        if _IPYTHON:
-            display(Image(app.get_graph().draw_mermaid_png()))
-        else:
-            logger.info("Graph structure:")
-            logger.info(app.get_graph().draw_mermaid())
-    except Exception as e:
-        logger.warning(f"Graph render skipped: {e}")
 
     logger.info("COMPETITOR PRICING AGENT - Starting run")
 
