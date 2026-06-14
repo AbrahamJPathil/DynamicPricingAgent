@@ -8,7 +8,7 @@ Graph nodes:
                       → advance_row      → (loop or END)
 
 Run:
-    python agent.py --api-key YOUR_KEY --csv products.csv
+    python inventory_agent.py --api-key YOUR_KEY --csv products.csv
 """
 
 import argparse
@@ -67,6 +67,8 @@ class AgentState(TypedDict):
     results:   List[dict]
     # internal cursor
     row_index: int
+    # populated by sort_by_urgency_node — full sorted processing queue
+    urgency_queue: List[dict]
 
 
 # ── Node 1: load_csv ───────────────────────────────────────────────────────────
@@ -74,9 +76,118 @@ def load_csv_node(state: AgentState) -> AgentState:
     """Reads the CSV and loads all rows into state."""
     with open(state["csv_path"], newline="") as f:
         state["rows"] = list(csv.DictReader(f))
-    state["row_index"] = 0
-    state["results"]   = []
+    state["row_index"]     = 0
+    state["results"]       = []
+    state["urgency_queue"] = []
     print(f"[load_csv] Loaded {len(state['rows'])} row(s)")
+    return state
+
+
+# ── Node 1b: sort_by_urgency ───────────────────────────────────────────────────
+# Urgency tier weights — lower number = processed first
+URGENCY_RANK = {"IMMEDIATE": 0, "HIGH": 1, "MEDIUM": 2, "SKIP": 3}
+
+def _precompute_urgency(row: dict) -> tuple[str, float]:
+    """
+    Lightweight pre-scan for a single row — no LLM, pure Python math.
+    Returns (urgency_label, loss_if_no_action) for sorting purposes.
+    Rows that are non-perishable or have no units at risk return ("SKIP", 0.0).
+    """
+    if row.get("is_perishable", "").strip().upper() != "TRUE":
+        return "SKIP", 0.0
+
+    try:
+        now    = datetime.now(timezone.utc)
+        expiry = datetime.fromisoformat(
+            row["expiry_datetime"].replace("Z", "+00:00")
+        )
+        days_to_expiry = max((expiry - now).total_seconds() / 86400, 0)
+        avg_daily      = float(row["avg_daily_units_sold"])
+        stock          = float(row["stock_on_hand"])
+        units_at_risk  = stock - (avg_daily * days_to_expiry)
+
+        if units_at_risk <= 0:
+            return "SKIP", 0.0
+
+        buyback          = float(row["producer_buyback_rate"])
+        repurposing      = float(row["repurposing_recovery_rate"])
+        cost_price       = float(row["cost_price"])
+        expiry_loss_rate = 1.0 - buyback - repurposing
+        loss_if_no_action = round(units_at_risk * cost_price * expiry_loss_rate, 2)
+
+        urgency = (
+            "IMMEDIATE" if days_to_expiry <= 1
+            else "HIGH"  if days_to_expiry <= 3
+            else "MEDIUM"
+        )
+        return urgency, loss_if_no_action
+
+    except (KeyError, ValueError):
+        return "SKIP", 0.0
+
+
+def sort_by_urgency_node(state: AgentState) -> AgentState:
+    """
+    Pre-scans ALL rows using pure Python math (no LLM).
+    Sorts by:
+      1. Urgency tier  — IMMEDIATE → HIGH → MEDIUM  (primary)
+      2. loss_if_no_action descending                (tiebreaker)
+    Prints the full processing queue before any LLM call is made.
+    Replaces state["rows"] with the sorted order so the downstream
+    row-by-row loop picks them up in priority sequence.
+    """
+    scored = []
+    for row in state["rows"]:
+        urgency, loss = _precompute_urgency(row)
+        scored.append({
+            "sku_id":           row.get("sku_id", "UNKNOWN"),
+            "product_name":     row.get("product_name", ""),
+            "urgency":          urgency,
+            "loss_if_no_action": loss,
+            "row":              row,
+        })
+
+    # Sort: urgency tier first (ascending rank), loss descending as tiebreaker
+    scored.sort(
+        key=lambda x: (URGENCY_RANK[x["urgency"]], -x["loss_if_no_action"])
+    )
+
+    # Replace rows with sorted order so the loop processes them in priority order
+    state["rows"] = [s["row"] for s in scored]
+
+    # Build the urgency queue — used only for display
+    state["urgency_queue"] = [
+        {k: v for k, v in s.items() if k != "row"}
+        for s in scored
+    ]
+
+    # ── Print the full processing queue before any LLM call ───────────────────
+    URGENCY_ICONS = {"IMMEDIATE": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "SKIP": "⚪"}
+    separator = "─" * 62
+
+    print(f"\n[sort_by_urgency] {separator}")
+    print(f"[sort_by_urgency]  PROCESSING QUEUE  ({len(scored)} SKU(s) total)")
+    print(f"[sort_by_urgency] {separator}")
+    print(f"[sort_by_urgency]  {'#':<4} {'SKU':<10} {'URGENCY':<11} "
+          f"{'LOSS IF NO ACTION':<20} PRODUCT")
+    print(f"[sort_by_urgency] {separator}")
+
+    for i, s in enumerate(scored, 1):
+        icon    = URGENCY_ICONS[s["urgency"]]
+        loss    = f"${s['loss_if_no_action']:.2f}" if s["urgency"] != "SKIP" else "—"
+        print(
+            f"[sort_by_urgency]  {i:<4} {s['sku_id']:<10} "
+            f"{icon} {s['urgency']:<9} {loss:<20} {s['product_name']}"
+        )
+
+    print(f"[sort_by_urgency] {separator}")
+
+    actionable = [s for s in scored if s["urgency"] != "SKIP"]
+    skipped    = [s for s in scored if s["urgency"] == "SKIP"]
+    print(f"[sort_by_urgency]  Actionable: {len(actionable)}   "
+          f"Skipped (no risk): {len(skipped)}")
+    print(f"[sort_by_urgency] {separator}\n")
+
     return state
 
 
@@ -261,6 +372,7 @@ def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
     graph.add_node("load_csv",          load_csv_node)
+    graph.add_node("sort_by_urgency",   sort_by_urgency_node)   # ← new
     graph.add_node("check_perishable",  check_perishable_node)
     graph.add_node("compute_expiry",    compute_expiry_node)
     graph.add_node("compute_loss",      compute_loss_node)
@@ -270,7 +382,8 @@ def build_graph() -> StateGraph:
     graph.add_node("advance_row",       advance_row_node)
 
     graph.set_entry_point("load_csv")
-    graph.add_edge("load_csv", "check_perishable")
+    graph.add_edge("load_csv",        "sort_by_urgency")        # ← new edge
+    graph.add_edge("sort_by_urgency", "check_perishable")       # ← new edge
 
     graph.add_conditional_edges("check_perishable", route_perishable, {
         "compute_expiry": "compute_expiry",
@@ -318,6 +431,7 @@ def main():
         "llm_response":      None,
         "results":           [],
         "row_index":         0,
+        "urgency_queue":     [],
     }
 
     final_state = app.invoke(initial_state)
