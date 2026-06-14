@@ -14,6 +14,7 @@ Run:
 import argparse
 import csv
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import TypedDict, Optional, List, Literal
 
@@ -21,6 +22,20 @@ from pydantic import BaseModel, Field, field_validator, model_validator, Validat
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+
+
+# ── Audit log paths ────────────────────────────────────────────────────────────
+PROPOSAL_LOG   = "proposals.jsonl"
+VALIDATION_LOG = "validations.jsonl"
+
+# Gemini 2.5 Flash pricing (USD per 1M tokens, as of June 2026)
+_PROMPT_COST_PER_1M     = 0.075
+_COMPLETION_COST_PER_1M = 0.30
+
+def _write_log(record: dict, path: str) -> None:
+    """Appends a single JSON record to a JSONL audit file."""
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -199,6 +214,8 @@ class AgentState(TypedDict):
     # inputs
     csv_path:   str
     api_key:    str
+    # run identifier — shared across all log records in one pipeline execution
+    run_id:     str
     # populated by load_csv_node
     rows:       List[dict]
     # current row being processed
@@ -216,7 +233,8 @@ class AgentState(TypedDict):
     # populated by call_llm_node
     llm_response: Optional[dict]
     # accumulated across all rows
-    results:   List[dict]
+    results:         List[dict]
+    all_token_usage: List[dict]   # one entry per SKU with an LLM call
     # internal cursor
     row_index: int
     # populated by sort_by_urgency_node — full sorted processing queue
@@ -228,10 +246,11 @@ def load_csv_node(state: AgentState) -> AgentState:
     """Reads the CSV and loads all rows into state."""
     with open(state["csv_path"], newline="") as f:
         state["rows"] = list(csv.DictReader(f))
-    state["row_index"]     = 0
-    state["results"]       = []
-    state["urgency_queue"] = []
-    print(f"[load_csv] Loaded {len(state['rows'])} row(s)")
+    state["row_index"]       = 0
+    state["results"]         = []
+    state["urgency_queue"]   = []
+    state["all_token_usage"] = []
+    print(f"[load_csv] Loaded {len(state['rows'])} row(s)  run_id={state['run_id']}")
     return state
 
 
@@ -426,9 +445,9 @@ def assign_urgency_node(state: AgentState) -> AgentState:
 # ── Node 6: call_llm ───────────────────────────────────────────────────────────
 def call_llm_node(state: AgentState) -> AgentState:
     """
-    Builds the prompt, calls Gemini, and validates the response against
-    the LLMProposal Pydantic schema. Falls back to a rule-based proposal
-    if parsing or validation fails — pipeline never crashes on bad LLM output.
+    Builds the prompt, calls Gemini, validates via Pydantic, and writes
+    a validation log record (including token counts) to validations.jsonl.
+    Falls back to a rule-based proposal if parsing or validation fails.
     """
     row = state["current_row"]
     sku = row.get("sku_id", "UNKNOWN")
@@ -455,11 +474,52 @@ Recommend a price modifier to clear stock before expiry."""
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
     response = llm.invoke(messages)
 
-    # ── Parse and validate via Pydantic ───────────────────────────────────────
-    proposal = parse_llm_response(response.content)
+    # ── Extract token usage from response.usage_metadata ─────────────────────
+    # LangChain wraps Gemini token counts in response.usage_metadata (not
+    # response.response_metadata). Keys are: input_tokens, output_tokens,
+    # total_tokens, input_token_details (dict with cache_read key).
+    usage            = response.usage_metadata or {}
+    prompt_tokens    = usage.get("input_tokens",  0)
+    completion_tokens= usage.get("output_tokens", 0)
+    total_tokens     = usage.get("total_tokens",  0)
+    cached_tokens    = (usage.get("input_token_details") or {}).get("cache_read", 0)
+    est_cost         = round(
+        (prompt_tokens     / 1_000_000) * _PROMPT_COST_PER_1M +
+        (completion_tokens / 1_000_000) * _COMPLETION_COST_PER_1M,
+        8
+    )
 
-    if proposal is None:
-        # Validation failed — emit rule-based fallback, flag for human review
+    token_record = {
+        "sku_id":             sku,
+        "prompt_tokens":      prompt_tokens,
+        "completion_tokens":  completion_tokens,
+        "total_tokens":       total_tokens,
+        "cached_tokens":      cached_tokens,
+        "estimated_cost_usd": est_cost,
+    }
+    state["all_token_usage"].append(token_record)
+
+    # ── Parse and validate via Pydantic ───────────────────────────────────────
+    proposal       = parse_llm_response(response.content)
+    fallback_used  = proposal is None
+    failure_reason = None
+
+    if fallback_used:
+        # Collect the first validation error message for the log
+        raw = response.content.strip()
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        elif raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        try:
+            from pydantic import ValidationError as _VE
+            LLMProposal(**json.loads(raw))
+        except Exception as exc:
+            failure_reason = str(exc)[:300]
+
         print(f"[call_llm] [{sku}] ⚠️  Validation failed — using fallback proposal")
         state["llm_response"] = fallback_proposal(state)
     else:
@@ -467,12 +527,32 @@ Recommend a price modifier to clear stock before expiry."""
         print(f"[call_llm] [{sku}] ✅ modifier={state['llm_response']['price_modifier']}  "
               f"confidence={state['llm_response']['confidence_score']}")
 
+    # ── Write validation log ───────────────────────────────────────────────────
+    _write_log({
+        "log_type":           "VALIDATION",
+        "run_id":             state["run_id"],
+        "sku_id":             sku,
+        "timestamp":          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "validation_passed":  not fallback_used,
+        "fallback_triggered": fallback_used,
+        "failure_reason":     failure_reason,
+        "model":              "gemini-2.5-flash",
+        "temperature":        0.2,
+        "tokens": {
+            "prompt":     prompt_tokens,
+            "completion": completion_tokens,
+            "total":      total_tokens,
+            "cached":     cached_tokens,
+        },
+        "estimated_cost_usd": est_cost,
+    }, VALIDATION_LOG)
+
     return state
 
 
 # ── Node 7: build_output ───────────────────────────────────────────────────────
 def build_output_node(state: AgentState) -> AgentState:
-    """Assembles the final JSON proposal and appends it to results."""
+    """Assembles the final JSON proposal, appends to results, and writes proposal log."""
     row = state["current_row"]
     llm = state["llm_response"]
 
@@ -510,6 +590,28 @@ def build_output_node(state: AgentState) -> AgentState:
         },
     }
     state["results"].append(output)
+
+    # ── Write proposal log ─────────────────────────────────────────────────────
+    _write_log({
+        "log_type":           "PROPOSAL",
+        "run_id":             state["run_id"],
+        "sku_id":             row["sku_id"],
+        "timestamp":          output["timestamp"],
+        "status":             status,
+        "urgency":            state["urgency"],
+        "suggested_action":   llm["suggested_action"],
+        "price_modifier":     llm["price_modifier"],
+        "confidence_score":   llm["confidence_score"],
+        "loss_if_no_action":  state["loss_if_no_action"],
+        "units_at_risk":      state["units_at_risk"],
+        "days_to_expiry":     state["days_to_expiry"],
+        "recovery_floor":     round(
+            float(row.get("producer_buyback_rate", 0.0)) +
+            float(row.get("repurposing_recovery_rate", 0.0)), 4
+        ),
+        "fallback_used":      is_fallback,
+    }, PROPOSAL_LOG)
+
     flag = " ⚠️  [FALLBACK — human review required]" if is_fallback else ""
     print(f"[build_output] [{row['sku_id']}] Proposal ready{flag}")
     return state
@@ -585,11 +687,14 @@ def main():
     parser.add_argument("--csv", default="products.csv", help="Path to inventory CSV")
     args = parser.parse_args()
 
-    app = build_graph()
+    app    = build_graph()
+    run_id = str(uuid.uuid4())[:8]
+    print(f"\n[main] Starting run  run_id={run_id}")
 
     initial_state: AgentState = {
         "csv_path":          args.csv,
         "api_key":           args.api_key,
+        "run_id":            run_id,
         "rows":              [],
         "current_row":       None,
         "is_perishable":     None,
@@ -600,13 +705,39 @@ def main():
         "urgency":           None,
         "llm_response":      None,
         "results":           [],
+        "all_token_usage":   [],
         "row_index":         0,
         "urgency_queue":     [],
     }
 
     final_state = app.invoke(initial_state)
 
-    print(f"\n✅ Done — {len(final_state['results'])} proposal(s) generated\n")
+    # ── Token summary ──────────────────────────────────────────────────────────
+    usage     = final_state["all_token_usage"]
+    sep       = "─" * 62
+    print(f"\n[main] {sep}")
+    print(f"[main]  TOKEN SUMMARY  run_id={run_id}")
+    print(f"[main] {sep}")
+    print(f"[main]  {'SKU':<10} {'PROMPT':>8} {'COMPLETION':>12} {'TOTAL':>8} {'COST (USD)':>12}")
+    print(f"[main] {sep}")
+    grand_prompt = grand_completion = grand_total = grand_cost = 0
+    for t in usage:
+        print(f"[main]  {t['sku_id']:<10} {t['prompt_tokens']:>8} "
+              f"{t['completion_tokens']:>12} {t['total_tokens']:>8} "
+              f"{t['estimated_cost_usd']:>12.6f}")
+        grand_prompt      += t["prompt_tokens"]
+        grand_completion  += t["completion_tokens"]
+        grand_total       += t["total_tokens"]
+        grand_cost        += t["estimated_cost_usd"]
+    print(f"[main] {sep}")
+    print(f"[main]  {'TOTAL':<10} {grand_prompt:>8} {grand_completion:>12} "
+          f"{grand_total:>8} {grand_cost:>12.6f}")
+    print(f"[main] {sep}")
+    print(f"[main]  Proposal log   → {PROPOSAL_LOG}")
+    print(f"[main]  Validation log → {VALIDATION_LOG}")
+    print(f"[main] {sep}\n")
+
+    print(f"✅ Done — {len(final_state['results'])} proposal(s) generated\n")
     for output in final_state["results"]:
         print(json.dumps(output, indent=2))
         print()
