@@ -8,7 +8,7 @@ Graph nodes:
                       → advance_row      → (loop or END)
 
 Run:
-    python inventory_agent.py --api-key YOUR_KEY --csv products.csv
+    python agent.py --api-key YOUR_KEY --csv products.csv
 """
 
 import argparse
