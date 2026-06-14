@@ -53,9 +53,9 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
     sys.exit("ERROR: GEMINI_API_KEY not set. Add it to your .env file.")
 
-BASE_DIR            = Path(__file__).parent
-CSV_PATH            = BASE_DIR / "data" / "calendar_data.csv"
-FESTIVAL_JSON_PATH  = BASE_DIR / "data" / "festival_calendar.json"
+BASE_DIR            = Path(__file__).parent.parent.parent   # agents/calendar/agent.py → repo root
+CSV_PATH            = BASE_DIR / "data" / "inputs" / "calendar" / "data.csv"
+FESTIVAL_JSON_PATH  = BASE_DIR / "data" / "inputs" / "calendar" / "data_festivals.json"
 LOOKAHEAD_DAYS      = 21
 PROX_WINDOW_DAYS    = 7
 
@@ -513,20 +513,21 @@ def build_graph():
 # 14. Entry point
 # ---------------------------------------------------------------------------
 def main():
-    import shutil
-    import time # <-- Add this
-
+    import time
+ 
     bootstrap_festival_json()
-
-    # FIX 1: Always copy the freshest CSV, overwriting the old one
-    SRC = Path("/mnt/user-data/uploads/calendar_data.csv")
-    if SRC.exists():
-        CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(SRC, CSV_PATH)
-        print(f"[bootstrap] Refreshed CSV → {CSV_PATH}")
-
+ 
+    # Ensure the data directory exists (for first-time setup)
+    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+ 
+    if not CSV_PATH.exists():
+        sys.exit(
+            f"\n❌ ERROR: {CSV_PATH} is missing!\n"
+            f"Place your product catalog CSV at:\n  {CSV_PATH}"
+        )
+ 
     app = build_graph()
-
+ 
     initial_state: AgentState = {
         "csv_path":            str(CSV_PATH),
         "today_str":           "2026-05-26",    # 1 day before Eid al-Adha
@@ -544,14 +545,14 @@ def main():
         "llm_response":        None,
         "results":             [],
     }
-
+ 
     final_state = app.invoke(initial_state)
-
+ 
     print(f"\n✅ Done — {len(final_state['results'])} proposal(s) generated\n")
     for output in final_state["results"]:
         print(json.dumps(output, indent=2))
         print()
-
+ 
     # FIX 2: Generate a unique run ID so files never overwrite each other
     run_id = int(time.time()) 
     out_dir = BASE_DIR / "output"
@@ -563,7 +564,7 @@ def main():
         with open(fname, "w") as fh:
             json.dump(output, fh, indent=2)
         print(f"[saved] → {fname}")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
