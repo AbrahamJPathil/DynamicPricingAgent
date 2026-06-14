@@ -1,0 +1,4 @@
+sku_id,current_temp_c,forecast_temp_c,weather_event_flag
+MEA001,32.8,35.0,Heatwave
+MEA002,22.0,20.0,ColdSnap
+MEA003,28.0,29.0,None
