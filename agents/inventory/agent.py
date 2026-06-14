@@ -15,8 +15,9 @@ import argparse
 import csv
 import json
 from datetime import datetime, timezone
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, List, Literal
 
+from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -33,13 +34,164 @@ Your job is to recommend an ideal selling price that:
 Respond ONLY with a valid JSON object using exactly this schema:
 {
   "suggested_action": "DISCOUNT",
-  "price_modifier": <float between 0 and 1, e.g. 0.65 means 65% of current price>,
-  "confidence_score": <float between 0 and 1>,
+  "price_modifier": <float between 0.10 and 1.0, e.g. 0.65 means 65% of current price>,
+  "confidence_score": <float between 0.0 and 1.0>,
   "urgency": <"IMMEDIATE" | "HIGH" | "MEDIUM">,
-  "headline": "<one line summary>",
-  "detailed_reasoning": "<two to three sentence explanation>"
+  "headline": "<one line summary, minimum 10 characters>",
+  "detailed_reasoning": "<two to three sentence explanation, minimum 30 characters>"
 }
 No preamble, no markdown fences, only the JSON object."""
+
+
+# ── Pydantic output schema ─────────────────────────────────────────────────────
+class LLMProposal(BaseModel):
+    suggested_action:   Literal["DISCOUNT", "HOLD", "SURCHARGE"]
+    price_modifier:     float = Field(ge=0.10, le=1.0)
+    confidence_score:   float = Field(ge=0.0,  le=1.0)
+    urgency:            Literal["IMMEDIATE", "HIGH", "MEDIUM"]
+    headline:           str   = Field(min_length=10)
+    detailed_reasoning: str   = Field(min_length=30)
+
+    # ── Field-level validators ─────────────────────────────────────────────────
+
+    @field_validator("price_modifier")
+    @classmethod
+    def modifier_not_suspiciously_low(cls, v: float) -> float:
+        """Catches catastrophically low modifiers that are almost certainly hallucinations."""
+        if v < 0.20:
+            raise ValueError(
+                f"price_modifier {v} is below 0.20 — likely a hallucination. "
+                f"Minimum realistic discount is 20% off current price."
+            )
+        return v
+
+    @field_validator("detailed_reasoning")
+    @classmethod
+    def reasoning_references_inventory(cls, v: str) -> str:
+        """
+        Catches responses where the LLM produced valid JSON but the reasoning
+        is completely disconnected from the inventory metrics passed in the prompt.
+        """
+        keywords = ["expir", "days", "units", "stock", "loss", "clear", "risk", "cost"]
+        if not any(kw in v.lower() for kw in keywords):
+            raise ValueError(
+                "detailed_reasoning does not reference any inventory metrics — "
+                "likely a generic or hallucinated response."
+            )
+        return v
+
+    # ── Cross-field validators ─────────────────────────────────────────────────
+
+    @model_validator(mode="after")
+    def urgency_modifier_consistency(self) -> "LLMProposal":
+        """
+        An IMMEDIATE SKU with a modifier above 0.85 implies only a 15% discount —
+        logically contradictory for a same-day expiry situation.
+        """
+        if self.urgency == "IMMEDIATE" and self.price_modifier > 0.85:
+            raise ValueError(
+                f"IMMEDIATE urgency but price_modifier={self.price_modifier} implies "
+                f"only a {round((1 - self.price_modifier) * 100)}% discount — "
+                f"insufficient for a same-day expiry SKU."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def action_modifier_consistency(self) -> "LLMProposal":
+        """
+        A SURCHARGE should never have modifier < 1.0.
+        A DISCOUNT should never have modifier >= 1.0.
+        """
+        if self.suggested_action == "SURCHARGE" and self.price_modifier < 1.0:
+            raise ValueError(
+                "suggested_action is SURCHARGE but price_modifier < 1.0 — contradictory."
+            )
+        if self.suggested_action == "DISCOUNT" and self.price_modifier >= 1.0:
+            raise ValueError(
+                "suggested_action is DISCOUNT but price_modifier >= 1.0 — contradictory."
+            )
+        return self
+
+
+# ── LLM response parser ────────────────────────────────────────────────────────
+def parse_llm_response(raw: str) -> Optional[LLMProposal]:
+    """
+    Cleans markdown fences, parses JSON, and validates against LLMProposal schema.
+    Returns None on any failure — caller must invoke fallback_proposal().
+    """
+    # Step 1: strip markdown fences correctly
+    raw = raw.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    elif raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    raw = raw.strip()
+
+    # Step 2: parse JSON
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[parse_llm_response] JSON parse failed: {e}")
+        print(f"[parse_llm_response] Raw output: {raw[:200]}")
+        return None
+
+    # Step 3: validate against Pydantic schema
+    try:
+        return LLMProposal(**data)
+    except ValidationError as e:
+        print(f"[parse_llm_response] Schema validation failed:")
+        for error in e.errors():
+            print(f"  field={error['loc']}  msg={error['msg']}")
+        return None
+
+
+# ── Rule-based fallback proposal ───────────────────────────────────────────────
+def fallback_proposal(state: "AgentState") -> dict:
+    """
+    Emitted when LLM output fails parsing or Pydantic validation.
+    Uses a deterministic risk-ratio formula for price_modifier.
+
+    Floor is derived from the SKU's actual recovery rates:
+        recovery_floor = producer_buyback_rate + repurposing_recovery_rate
+    This means SKUs with zero recovery (e.g. deli, bakery with no buyback
+    and no repurposing) get a steeper floor than SKUs with meaningful
+    supplier credit or repurposing options. The floor represents the
+    minimum modifier at which selling is still better than expiry.
+
+    confidence_score=0.0 signals to the orchestrator that this proposal
+    was not LLM-generated and requires human review before applying.
+    """
+    row        = state["current_row"]
+    d          = state["days_to_expiry"]
+    stock      = float(row["stock_on_hand"])
+    risk_ratio = state["units_at_risk"] / stock if stock > 0 else 1.0
+
+    # Dynamic floor: sum of what the store recovers per unit if it expires anyway.
+    # Selling at this modifier = breaking even vs doing nothing.
+    # Never allow floor to be 0.0 — always push for some revenue over pure loss.
+    producer_buyback  = float(row.get("producer_buyback_rate", 0.0))
+    repurposing       = float(row.get("repurposing_recovery_rate", 0.0))
+    recovery_floor    = round(producer_buyback + repurposing, 4)
+
+    # Higher risk ratio → steeper discount, floored at recovery_floor
+    base_modifier = round(max(1.0 - (risk_ratio * 0.6), recovery_floor), 2)
+
+    return {
+        "suggested_action":   "DISCOUNT",
+        "price_modifier":     base_modifier,
+        "confidence_score":   0.0,
+        "urgency":            state["urgency"],
+        "headline":           "Fallback proposal — LLM output failed validation",
+        "detailed_reasoning": (
+            f"Rule-based fallback applied. {state['units_at_risk']} units at risk "
+            f"with {d} days to expiry. Modifier {base_modifier} derived from "
+            f"risk ratio {risk_ratio:.2f}, floored at recovery rate "
+            f"{recovery_floor} (buyback={producer_buyback} + "
+            f"repurposing={repurposing}). Manual review required."
+        ),
+    }
 
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -273,7 +425,11 @@ def assign_urgency_node(state: AgentState) -> AgentState:
 
 # ── Node 6: call_llm ───────────────────────────────────────────────────────────
 def call_llm_node(state: AgentState) -> AgentState:
-    """Builds the prompt from computed metrics and calls Gemini."""
+    """
+    Builds the prompt, calls Gemini, and validates the response against
+    the LLMProposal Pydantic schema. Falls back to a rule-based proposal
+    if parsing or validation fails — pipeline never crashes on bad LLM output.
+    """
     row = state["current_row"]
     sku = row.get("sku_id", "UNKNOWN")
 
@@ -298,10 +454,19 @@ Recommend a price modifier to clear stock before expiry."""
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
     response = llm.invoke(messages)
-    raw = response.content.strip().strip("```json").strip("```").strip()
-    state["llm_response"] = json.loads(raw)
-    print(f"[call_llm] [{sku}] modifier={state['llm_response']['price_modifier']}  "
-          f"confidence={state['llm_response']['confidence_score']}")
+
+    # ── Parse and validate via Pydantic ───────────────────────────────────────
+    proposal = parse_llm_response(response.content)
+
+    if proposal is None:
+        # Validation failed — emit rule-based fallback, flag for human review
+        print(f"[call_llm] [{sku}] ⚠️  Validation failed — using fallback proposal")
+        state["llm_response"] = fallback_proposal(state)
+    else:
+        state["llm_response"] = proposal.model_dump()
+        print(f"[call_llm] [{sku}] ✅ modifier={state['llm_response']['price_modifier']}  "
+              f"confidence={state['llm_response']['confidence_score']}")
+
     return state
 
 
@@ -311,10 +476,14 @@ def build_output_node(state: AgentState) -> AgentState:
     row = state["current_row"]
     llm = state["llm_response"]
 
+    # If confidence_score is 0.0 it is a fallback proposal — mark status accordingly
+    is_fallback = llm["confidence_score"] == 0.0
+    status      = "FALLBACK" if is_fallback else "COMPLETED"
+
     output = {
         "agent_id":  "inventory_perishability",
         "sku_id":    row["sku_id"],
-        "status":    "COMPLETED",
+        "status":    status,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "metrics_evaluated": {
             "product_name":         row["product_name"],
@@ -341,7 +510,8 @@ def build_output_node(state: AgentState) -> AgentState:
         },
     }
     state["results"].append(output)
-    print(f"[build_output] [{row['sku_id']}] Proposal ready")
+    flag = " ⚠️  [FALLBACK — human review required]" if is_fallback else ""
+    print(f"[build_output] [{row['sku_id']}] Proposal ready{flag}")
     return state
 
 
