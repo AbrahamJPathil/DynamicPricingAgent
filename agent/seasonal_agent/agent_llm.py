@@ -1,6 +1,6 @@
 from google import genai
 import os
-import json
+import json                    
 import re
 
 from dotenv import load_dotenv
@@ -21,6 +21,7 @@ from langgraph.graph import StateGraph
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 print("Agent started")
+
 #state
 class SeasonalState(TypedDict):
 
@@ -367,7 +368,7 @@ def seasonal_agent(row):
     ]
     
 
-""" if __name__ == "__main__":
+if __name__ == "__main__":
 
     test_row = {
 
@@ -397,4 +398,4 @@ def seasonal_agent(row):
             result,
             indent=4
         )
-    ) """
+    ) 
